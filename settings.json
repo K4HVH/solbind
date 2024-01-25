@@ -1,0 +1,4 @@
+{
+    "private_key": "your_key_here",
+    "rpc_url": "https://api.mainnet-beta.solana.com"
+}
