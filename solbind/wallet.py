@@ -6,9 +6,8 @@ import os
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
-from solbind.settings import settings
+np.random.seed(42)
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -126,21 +125,27 @@ class wallet:
             smoothing_period = 3
 
             data = pd.DataFrame({'High': high, 'Low': low, 'Close': close, 'Timestamp': timestamp})
-            
+
+            # Sort by timestamp to ensure consistent order
+            data = data.sort_values(by='Timestamp')
+
+            # Set seed for reproducibility
+            np.random.seed(42)
+
             # Calculate %K
             data['Lowest Low'] = data['Low'].rolling(window=k_period, min_periods=1).min()
             data['Highest High'] = data['High'].rolling(window=k_period, min_periods=1).max()
             data['%K'] = ((data['Close'] - data['Lowest Low']) / (data['Highest High'] - data['Lowest Low'])) * 100
-            
+
             # Calculate %D (3-period SMA of %K)
             data['%D'] = data['%K'].rolling(window=d_period, min_periods=1).mean()
-            
+
             # Calculate Smoothing (3-period SMA of %D)
             data['Smoothing'] = data['%D'].rolling(window=smoothing_period, min_periods=1).mean()
 
             # Drop unnecessary columns
             data = data.drop(['Lowest Low', 'Highest High'], axis=1)
-            
+
             return data[['Timestamp', '%K', '%D', 'Smoothing']].dropna()
 
         @classmethod
