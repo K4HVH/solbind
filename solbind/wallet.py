@@ -1,8 +1,13 @@
 import base58
+import base64
 import json
 import time
 import requests
 import os
+import ccxt
+import asyncio
+import datetime
+import pytz
 
 import pandas as pd
 import numpy as np
@@ -11,15 +16,23 @@ np.random.seed(42)
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+from solders import message
 
 from solana.rpc.api import Client
-from solana.rpc.types import TokenAccountOpts
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TokenAccountOpts, TxOpts
+from solana.rpc.commitment import Processed
+
+from jupiter_python_sdk.jupiter import Jupiter, Jupiter_DCA
+
+
+from solbind.settings import settings
 
 class wallet:
 
     sol_balance = ["", "", ""]
     usdc_balance = ["", "", ""]
-
 
     coin_stats_json = []
     coin_stats_parsed = [0, 0, 0, 0]
@@ -40,6 +53,8 @@ class wallet:
                 cls.coin_stats_parsed[1] = cls.coin_stats_json['RAW']['SOL']['USD']['PRICE']
                 cls.coin_stats_parsed[2] = cls.coin_stats_json['RAW']['USDC']['AUD']['PRICE']
                 cls.coin_stats_parsed[3] = cls.coin_stats_json['RAW']['USDC']['USD']['PRICE']
+
+                print(cls.coin_stats_parsed[1])
             else:
                 # Print an error message if the request was not successful
                 logger.print_and_log(f"Error while retrieving coin stats: {response.status_code} - {response.text}")
@@ -84,94 +99,115 @@ class wallet:
         print(f"Wallet Balance: {cls.sol_balance[0]:.5f} SOL         ${cls.sol_balance[1]:.2f} AUD        ${cls.sol_balance[2]:.2f} USD".center(term_size.columns))
         print(f"Wallet Balance: {cls.usdc_balance[0]:.5f} USDC       ${cls.usdc_balance[1]:.2f} AUD       ${cls.usdc_balance[2]:.2f} USD".center(term_size.columns))
         print(f"Total Balance: ${cls.sol_balance[1] + cls.usdc_balance[1]:.2f} AUD       ${cls.sol_balance[2] + cls.usdc_balance[2]:.2f} USD".center(term_size.columns))
+            
+class Swap:
+    def __init__(self, private_key_str, rpc_url):
+        self.private_key = Keypair.from_bytes(base58.b58decode(private_key_str))
+        self.rpc_url = rpc_url
+        self.async_client = AsyncClient(rpc_url)
+        self.jupiter = None  # Will be initialized when needed
 
+    async def initialize_jupiter(self):
+        if not self.jupiter:
+            self.jupiter = Jupiter(self.async_client, self.private_key)
 
-    class StochasticCalculator:
-        @staticmethod
-        def parse_json_response(api_response, logger):
-            # Check if the response is successful
-            if api_response.get('Response') == 'Success':
-                data = api_response.get('Data', {}).get('Data', [])
+    async def swap(self, logger, input_mint, output_mint, amount, slippage_bps, retry_limit=3, for_output_amount=False):
+        await self.initialize_jupiter()
+        if for_output_amount:
+            amount = round(self.calculate_required_input(output_mint, amount, logger))
+        retry_count = 0
+        while retry_count < retry_limit:
+            try:
+                transaction_data = await self.jupiter.swap(
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount=amount,
+                    slippage_bps=slippage_bps
+                )
+                raw_transaction = VersionedTransaction.from_bytes(base64.b64decode(transaction_data))
+                signature = self.private_key.sign_message(message.to_bytes_versioned(raw_transaction.message))
+                signed_txn = VersionedTransaction.populate(raw_transaction.message, [signature])
+                opts = TxOpts(skip_preflight=False, preflight_commitment=Processed)
+                result = await self.async_client.send_raw_transaction(txn=bytes(signed_txn), opts=opts)
+                transaction_id = json.loads(result.to_json())['result']
+                print(f"Transaction successful: https://explorer.solana.com/tx/{transaction_id}")
+                return transaction_id
+            except Exception as e:
+                retry_count += 1
+                print(f"Attempt {retry_count} failed: {e}")
+                if retry_count >= retry_limit:
+                    print("Max retry limit reached. Transaction failed.")
+                    break
+                await asyncio.sleep(2)  # Wait before retrying
 
-                parsed_data = []
-                for entry in data:
-                    time = entry.get('time')
-                    high = entry.get('high')
-                    low = entry.get('low')
-                    open_price = entry.get('open')
-                    volume_from = entry.get('volumefrom')
-                    volume_to = entry.get('volumeto')
-                    close = entry.get('close')
+    def calculate_required_input(self, output_mint, desired_output_amount, logger):
 
-                    parsed_data.append({
-                        'time': time,
-                        'high': high,
-                        'low': low,
-                        'open': open_price,
-                        'volume_from': volume_from,
-                        'volume_to': volume_to,
-                        'close': close
-                    })
+        wallet.retrieve_coin_stats(logger)
+        
+        if output_mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":
+            output_amount = (1 / wallet.coin_stats_parsed[1]) * desired_output_amount 
+        elif output_mint == "So11111111111111111111111111111111111111112":
+            output_amount = (wallet.coin_stats_parsed[1] / 1) * desired_output_amount 
+    
+        return output_amount
 
-                return parsed_data
-            else:
-                logger.print_and_log("Historic API response was not successful.")
-                return None
+    async def close(self):
+        await self.async_client.close()
 
-        @staticmethod
-        def calculate_slow_stochastic(high, low, close, timestamp):
-            k_period = 14
-            d_period = 3
-            smoothing_period = 3
+class Trader:
+    
+    @staticmethod
+    def wait_until_end_of_trading_period(trading_period, trader_exit=None):
+        # Get current date and time in GMT
+        gmt = pytz.timezone('GMT')
+        current_datetime_gmt = datetime.datetime.now(gmt)
 
-            data = pd.DataFrame({'High': high, 'Low': low, 'Close': close, 'Timestamp': timestamp})
+        # Calculate the start of the current trading period
+        start_of_trading_period = current_datetime_gmt.replace(hour=0, minute=0, second=0, microsecond=0)
+        while start_of_trading_period + trading_period < current_datetime_gmt:
+            start_of_trading_period += trading_period
 
-            # Sort by timestamp to ensure consistent order
-            data = data.sort_values(by='Timestamp')
+        # Calculate the end of the current trading period
+        end_of_trading_period = start_of_trading_period + trading_period
 
-            # Set seed for reproducibility
-            np.random.seed(42)
+        # Print information
+        print(f"Current time (GMT): {current_datetime_gmt}")
+        print(f"Start of trading period (GMT): {start_of_trading_period}")
+        print(f"End of trading period (GMT): {end_of_trading_period}")
 
-            # Calculate %K
-            data['Lowest Low'] = data['Low'].rolling(window=k_period, min_periods=1).min()
-            data['Highest High'] = data['High'].rolling(window=k_period, min_periods=1).max()
-            data['%K'] = ((data['Close'] - data['Lowest Low']) / (data['Highest High'] - data['Lowest Low'])) * 100
+        # Calculate the duration to wait until the end of the current trading period
+        time_to_wait = (end_of_trading_period - current_datetime_gmt).total_seconds()
 
-            # Calculate %D (3-period SMA of %K)
-            data['%D'] = data['%K'].rolling(window=d_period, min_periods=1).mean()
+        # Print information about the wait
+        print(f"Waiting until end of trading period... ({datetime.timedelta(seconds=time_to_wait)})")
 
-            # Calculate Smoothing (3-period SMA of %D)
-            data['Smoothing'] = data['%D'].rolling(window=smoothing_period, min_periods=1).mean()
+        # Wait until end of trading period or exit flag is set
+        check_interval = 1  # Check every second
+        while time_to_wait > 0:
+            if trader_exit is not None and trader_exit.is_set():
+                print("Exit flag set. Exiting early...")
+                return
+            sleep_duration = min(time_to_wait, check_interval)
+            time.sleep(sleep_duration)
+            time_to_wait -= sleep_duration
 
-            # Drop unnecessary columns
-            data = data.drop(['Lowest Low', 'Highest High'], axis=1)
+        print("End of trading period reached!")
+        
+    @staticmethod
+    def run_trader(trader_exit, logger):
+        while not trader_exit.is_set():
+            Trader.wait_until_end_of_trading_period(datetime.timedelta(minutes=1), trader_exit)
 
-            return data[['Timestamp', '%K', '%D', 'Smoothing']].dropna()
+            if not trader_exit.is_set():  # Make sure we arent going to trade on shutdown
+                trade_instance = Swap(settings.private_key, settings.rpc_url)
 
-        @classmethod
-        def process_json_and_calculate_stochastic(cls, logger):
-            # Parse JSON response
-            response = requests.get("https://min-api.cryptocompare.com/data/v2/histohour?fsym=SOL&tsym=USD&limit=336")
-            parsed_data = cls.parse_json_response(response.json(), logger)
-
-            if parsed_data:
-                # Extract required data for Slow Stochastic Oscillator calculation
-                high_data = [entry['high'] for entry in parsed_data]
-                low_data = [entry['low'] for entry in parsed_data]
-                close_data = [entry['close'] for entry in parsed_data]
-                timestamp_data = [entry['time'] for entry in parsed_data]
-
-                # Calculate Slow Stochastic Oscillator
-                stochastic_result = cls.calculate_slow_stochastic(high_data, low_data, close_data, timestamp_data)
-
-                # Print the latest values of %K, %D, and Smoothing
-                latest_values = stochastic_result.iloc[-1]
-                latest_k = latest_values['%K']
-                latest_d = latest_values['%D']
-                latest_smoothing = latest_values['Smoothing']
-
-                logger.print_and_log(f"Latest Values: K={latest_k:.2f}%, D={latest_d:.2f}%, Smooth={latest_smoothing:.2f}%")
-
-                return stochastic_result
-            else:
-                return None
+                asyncio.run(trade_instance.swap(
+                    logger, 
+                    input_mint="So11111111111111111111111111111111111111112",
+                    output_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    amount=int(1 * 1000000000),
+                    slippage_bps=1,
+                    retry_limit=3, 
+                    for_output_amount=True
+                ))
+        return

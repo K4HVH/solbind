@@ -5,7 +5,6 @@ class settings:
 
     private_key = ""
     rpc_url = ""
-    api_key = ""
 
     @classmethod
     def read_settings(cls):
