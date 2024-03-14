@@ -5,6 +5,8 @@ class settings:
 
     private_key = ""
     rpc_url = ""
+    strategy = 0
+    amount = 0
 
     @classmethod
     def read_settings(cls):
@@ -27,7 +29,9 @@ class settings:
     def write_settings(cls, variable_name=None, variable_value=None):
         settings_data = {
             "private_key": cls.private_key,
-            "rpc_url": cls.rpc_url
+            "rpc_url": cls.rpc_url,
+            "strategy": cls.strategy,
+            "amount": cls.amount
         }
 
         # If a specific variable is provided, update only that variable
@@ -42,12 +46,12 @@ class settings:
         cls.read_settings()
 
         logger.print_and_log("Current settings:")
-        logger.print_and_log({"private_key": cls.private_key, "rpc_url": cls.rpc_url})
+        logger.print_and_log({"private_key": cls.private_key, "rpc_url": cls.rpc_url, "strategy": cls.strategy, "amount": cls.amount})
 
         logger.print_and_log("Let's configure the settings.")
 
         # Get user input for settings
-        keys_to_configure = ["private_key", "rpc_url"]
+        keys_to_configure = ["private_key", "rpc_url", "strategy", "amount"]
         for key in keys_to_configure:
             current_value = getattr(cls, key, "")
             new_value = input(f"Enter value for {key} ({current_value}): ") or current_value
@@ -69,7 +73,7 @@ class settings:
         settings_data = cls.read_settings()
 
         # Check if each variable exists and has a valid value
-        required_variables = ["private_key", "rpc_url"]
+        required_variables = ["private_key", "rpc_url", "strategy", "amount"]
         missing_variables = []
         invalid_variables = []
 
